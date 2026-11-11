@@ -192,6 +192,14 @@ pub fn parse(raw: &[u8], ctx: &ParseContext) -> Option<Parsed> {
     })
 }
 
+/// 提取 Bcc 收件人（仅发送回退路径用：compose 写入 Bcc 头，Graph 草稿需要 bccRecipients）
+pub fn parse_bcc(raw: &[u8]) -> Vec<String> {
+    let Some(message) = MessageParser::default().parse(raw) else {
+        return Vec::new();
+    };
+    format_addresses(message.bcc())
+}
+
 /// 只解析头部（同步列表用，避免下载整封邮件）
 pub fn parse_header(raw: &[u8], ctx: &ParseContext) -> Option<HeaderRow> {
     let message = MessageParser::default().parse(raw)?;

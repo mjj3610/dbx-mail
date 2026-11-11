@@ -2,6 +2,7 @@
  * 渲染验收脚本：打开 demo 界面 → 打开富格式样例邮件 → 拦截态截图 → 放开图片 → 再截图
  * 顺带校验 <style> 作用域、图片尺寸与 class，避免只看截图靠肉眼猜。
  */
+import { fileURLToPath } from 'node:url'
 import { chromium, executablePath } from './browser.mjs'
 import { mkdirSync } from 'node:fs'
 

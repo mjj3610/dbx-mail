@@ -20,6 +20,7 @@ import type {
   ThreadItem,
 } from '../lib/rpc'
 import { demoEnabled } from '../lib/demo'
+import { hostConnectionId } from '../lib/bridge'
 import { useUI } from './ui'
 
 export type ScopeKind =
@@ -75,6 +76,9 @@ interface MailState {
   settings: Settings
   counts: Counts
 
+  /** 宿主连接作用域（context.connectionId → 绑定账户）：0 = 未作用域（多账户 UI） */
+  connectionAccountId: number
+
   scope: Scope
   filter: FilterKind
   query: string
@@ -95,9 +99,13 @@ interface MailState {
   drafts: Draft[]
   outboxItems: OutboxItem[]
   syncing: boolean
+  /** 正在同步的文件夹与进度（done/total），来自 sync/status 轮询 */
+  progress: { mailbox: string; done: number; total: number } | null
   lastSyncAt: number
 
   init: () => Promise<void>
+  /** 宿主 init/context 到达后幂等补作用域（独立邮箱 tab） */
+  applyConnectionScope: () => Promise<void>
   reloadMeta: () => Promise<void>
   setScope: (scope: Scope) => void
   setFilter: (filter: FilterKind) => void
@@ -140,6 +148,8 @@ export const useMail = create<MailState>((set, get) => ({
   settings: DEFAULT_SETTINGS,
   counts: EMPTY_COUNTS,
 
+  connectionAccountId: 0,
+
   scope: { kind: 'all-inbox' },
   filter: 'all',
   query: '',
@@ -160,13 +170,29 @@ export const useMail = create<MailState>((set, get) => ({
   drafts: [],
   outboxItems: [],
   syncing: false,
+  progress: null,
   lastSyncAt: 0,
 
   init: async () => {
     set({ error: '' })
     try {
-      const data: Bootstrap = await api.bootstrap()
+      // 宿主连接作用域：connection-provider 打开的 tab 只服务绑定的那个邮箱
+      const connectionId = hostConnectionId()
+      let scopedAccountId = 0
+      if (connectionId) {
+        try {
+          const { account } = await api.accountByConnection(connectionId)
+          scopedAccountId = account?.id ?? 0
+        } catch {
+          /* 解析失败按未作用域打开（多账户 UI） */
+        }
+      }
+      const data: Bootstrap = await api.bootstrap(scopedAccountId || undefined)
       applyBootstrap(set, data)
+      // 作用域内默认看该账户的收件箱聚合，列表查询全程携带 accountId
+      if (scopedAccountId) {
+        set({ connectionAccountId: scopedAccountId, scope: { kind: 'all-inbox', accountId: scopedAccountId } })
+      }
       set({ ready: true })
       await get().loadList(true)
     } catch (error) {
@@ -176,21 +202,41 @@ export const useMail = create<MailState>((set, get) => ({
 
   reloadMeta: async () => {
     try {
-      const data = await api.bootstrap()
+      const data = await api.bootstrap(get().connectionAccountId || undefined)
       applyBootstrap(set, data)
     } catch {
       /* 元数据刷新失败不打断当前阅读 */
     }
   },
 
+  applyConnectionScope: async () => {
+    // 幂等：宿主 init 晚于插件启动时（ready 超时路径）由 onInit 兜底再跑一次
+    const connectionId = hostConnectionId()
+    if (!connectionId || get().connectionAccountId) return
+    try {
+      const { account } = await api.accountByConnection(connectionId)
+      const scoped = account?.id ?? 0
+      if (!scoped || get().connectionAccountId) return
+      const data: Bootstrap = await api.bootstrap(scoped)
+      applyBootstrap(set, data)
+      set({ connectionAccountId: scoped, scope: { kind: 'all-inbox', accountId: scoped } })
+      await get().loadList(true)
+    } catch {
+      /* 解析失败按未作用域打开（多账户 UI） */
+    }
+  },
+
   setScope: (scope) => {
-    set({ scope, checked: [], thread: null, messages: [], detail: null, activeId: null, query: '' })
+    // 作用域内强制收敛到绑定账户，避免聚合视图串到其他账户
+    const scoped = get().connectionAccountId
+    const effective = scoped ? { ...scope, accountId: scoped } : scope
+    set({ scope: effective, checked: [], thread: null, messages: [], detail: null, activeId: null, query: '' })
     void get().loadList(true)
-    if (scope.kind === 'drafts') void get().loadDrafts()
-    if (scope.kind === 'outbox') void get().loadOutbox()
-    if (scope.kind === 'outbox' || scope.kind === 'drafts') set({ threads: [] })
+    if (effective.kind === 'drafts') void get().loadDrafts()
+    if (effective.kind === 'outbox') void get().loadOutbox()
+    if (effective.kind === 'outbox' || effective.kind === 'drafts') set({ threads: [] })
     // 自定义文件夹不在默认同步范围内，第一次点进来时补拉
-    const mailboxId = scope.kind === 'mailbox' ? scope.mailboxId : undefined
+    const mailboxId = effective.kind === 'mailbox' ? effective.mailboxId : undefined
     if (mailboxId) void get().syncFolderIfNeeded(mailboxId)
   },
 
@@ -354,6 +400,18 @@ export const useMail = create<MailState>((set, get) => ({
   sync: async (mailboxId) => {
     if (get().syncing) return
     set({ syncing: true })
+    // 同步期间轮询进度（sync/status），列表按钮展示 N/M；demo 模式没有该接口，静默忽略
+    const poll = setInterval(() => {
+      void api
+        .syncStatus()
+        .then((status) => {
+          const item = status.progress?.[0]
+          set({
+            progress: item ? { mailbox: item.mailbox, done: item.done, total: item.total } : null,
+          })
+        })
+        .catch(() => {})
+    }, 600)
     try {
       const params: { mailboxId?: number } = {}
       if (mailboxId) params.mailboxId = mailboxId
@@ -366,7 +424,8 @@ export const useMail = create<MailState>((set, get) => ({
       set({ error: message })
       toast.error(message)
     } finally {
-      set({ syncing: false, lastSyncAt: Date.now() })
+      clearInterval(poll)
+      set({ syncing: false, progress: null, lastSyncAt: Date.now() })
     }
   },
 

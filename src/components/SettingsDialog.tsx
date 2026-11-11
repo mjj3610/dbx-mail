@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
-import { Check, Loader2, Plus, RefreshCw, Trash2, X } from 'lucide-react'
+import { Check, Loader2, Plus, RefreshCw, ShieldCheck, Trash2, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { t } from '../lib/i18n'
 import { LOCALES } from '../lib/i18n'
 import { displayName } from '../lib/format'
+import * as api from '../lib/rpc'
 import type { Account, Settings } from '../lib/rpc'
 import { useMail } from '../stores/mail'
 import { useUI } from '../stores/ui'
@@ -319,6 +320,8 @@ function AccountCard({ account, locale }: { account: Account; locale: string }) 
   const [signature, setSignature] = useState(account.signature)
   const [confirming, setConfirming] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [reauthBusy, setReauthBusy] = useState(false)
+  const isGraph = account.provider === 'graph'
 
   useEffect(() => {
     setSignature(account.signature)
@@ -328,26 +331,83 @@ function AccountCard({ account, locale }: { account: Account; locale: string }) 
     if (signature === account.signature) return
     setBusy(true)
     try {
-      await updateAccount({
+      const base = {
         id: account.id,
         email: account.email,
         displayName: account.displayName,
         username: account.username,
-        imapHost: account.imapHost,
-        imapPort: account.imapPort,
-        imapSecurity: account.imapSecurity,
-        smtpHost: account.smtpHost,
-        smtpPort: account.smtpPort,
-        smtpSecurity: account.smtpSecurity,
         signature,
         syncEnabled: account.syncEnabled,
         syncInterval: account.syncInterval,
-      })
+      }
+      await updateAccount(
+        isGraph
+          ? {
+              ...base,
+              provider: 'graph',
+              tenantId: account.tenantId,
+              clientId: account.clientId,
+              // App-only 账户：漏传会被后端清空 user_id，令牌从此打到 /me 而失败
+              userId: account.userId,
+            }
+          : {
+              ...base,
+              imapHost: account.imapHost,
+              imapPort: account.imapPort,
+              imapSecurity: account.imapSecurity,
+              smtpHost: account.smtpHost,
+              smtpPort: account.smtpPort,
+              smtpSecurity: account.smtpSecurity,
+            },
+      )
       toast.success(t(locale, 'settings.accountSaved'))
     } catch (error) {
       toast.error(t(locale, 'settings.saveFailed', { message: error instanceof Error ? error.message : String(error) }))
     } finally {
       setBusy(false)
+    }
+  }
+
+  /** Graph 重新授权：重走浏览器授权 → 认领新 refresh_token */
+  const reauthorize = async () => {
+    if (reauthBusy) return
+    setReauthBusy(true)
+    try {
+      const begin = await api.oauthBegin(account.tenantId || 'common', account.clientId, undefined, account.id)
+      window.open(begin.authorizeUrl, '_blank', 'noopener')
+      toast.info(t(locale, 'settings.reauthOpened'))
+      const deadline = Date.now() + 5 * 60 * 1000
+      let status = await api.oauthStatus(begin.state)
+      while (status.status === 'pending' && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 2000))
+        status = await api.oauthStatus(begin.state)
+      }
+      if (status.status !== 'done') {
+        toast.error(
+          status.status === 'failed'
+            ? `${t(locale, 'wizard.authFailed')}：${status.error}`
+            : t(locale, 'wizard.authExpired'),
+        )
+        return
+      }
+      await updateAccount({
+        id: account.id,
+        email: account.email,
+        displayName: account.displayName,
+        username: account.username,
+        provider: 'graph',
+        tenantId: account.tenantId,
+        clientId: account.clientId,
+        signature,
+        syncEnabled: account.syncEnabled,
+        syncInterval: account.syncInterval,
+        oauthState: begin.state,
+      })
+      toast.success(t(locale, 'settings.reauthOk'))
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setReauthBusy(false)
     }
   }
 
@@ -360,7 +420,10 @@ function AccountCard({ account, locale }: { account: Account; locale: string }) 
         <div className="grow">
           <div className="acct-title">{displayName(account.displayName, account.email)}</div>
           <div className="acct-sub">
-            {account.email} · {account.imapHost}:{account.imapPort} · {account.smtpHost}:{account.smtpPort}
+            {account.email} ·{' '}
+            {isGraph
+              ? `Graph OAuth2 · ${account.tenantId || 'common'}`
+              : `${account.imapHost}:${account.imapPort} · ${account.smtpHost}:${account.smtpPort}`}
           </div>
           {account.lastError && (
             <div className="acct-sub" style={{ color: 'var(--red)' }}>
@@ -368,6 +431,16 @@ function AccountCard({ account, locale }: { account: Account; locale: string }) 
             </div>
           )}
         </div>
+        {isGraph && (
+          <button
+            className="icon-btn"
+            title={t(locale, 'settings.reauth')}
+            disabled={reauthBusy}
+            onClick={() => void reauthorize()}
+          >
+            {reauthBusy ? <Loader2 size={15} className="spin" /> : <ShieldCheck size={15} />}
+          </button>
+        )}
         <button className="icon-btn" title={t(locale, 'settings.syncNow')} onClick={() => void sync()}>
           <RefreshCw size={15} />
         </button>

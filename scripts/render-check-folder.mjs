@@ -3,6 +3,7 @@
  * 1) 同角色的两个文件夹（Junk / 广告邮件）在侧栏用真实名字区分，不重复成两个「垃圾邮件」
  * 2) 打开从未同步过的自定义文件夹（订阅邮件）时自动触发一次同步，并给出「同步此文件夹」入口
  */
+import { fileURLToPath } from 'node:url'
 import { chromium, executablePath } from './browser.mjs'
 
 const exe = executablePath

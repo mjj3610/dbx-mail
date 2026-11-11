@@ -16,6 +16,7 @@
 .env.*
 
 # 编辑器 / 本地工作区（含会话记录与草稿，不进公开仓库）
+.zcode/
 .workbuddy/
 .vscode/
 .idea/

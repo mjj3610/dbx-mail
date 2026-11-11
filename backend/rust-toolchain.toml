@@ -1,5 +1,0 @@
-# Windows 上默认 MSVC 工具链的 link.exe 常被 Git 自带的 link 抢占，
-# 统一固定 gnu 工具链，保证 `cargo build`（含宿主打包器调用）行为一致。
-[toolchain]
-channel = "stable-x86_64-pc-windows-gnu"
-profile = "minimal"

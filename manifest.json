@@ -29,6 +29,80 @@
       "label": "邮件",
       "description": "本地优先的多账户邮件工作台：会话列表、阅读器、富文本撰写与离线发件箱。",
       "icon": "assets/plugin.svg"
+    },
+    {
+      "type": "mcp",
+      "id": "com.mjj3610.mail.mcp",
+      "description": "Mail tools over the plugin's own accounts: list, read, flag, move and send messages.",
+      "external_tools": true,
+      "toolsets": [
+        {
+          "id": "mailbox-read",
+          "title": "Reading mail"
+        },
+        {
+          "id": "mailbox-write",
+          "title": "Mail actions"
+        }
+      ],
+      "tools": {
+        "folder_list": {
+          "toolset": "mailbox-read",
+          "access": "read"
+        },
+        "mail_list": {
+          "toolset": "mailbox-read",
+          "access": "read"
+        },
+        "mail_read": {
+          "toolset": "mailbox-read",
+          "access": "read"
+        },
+        "mail_flag": {
+          "toolset": "mailbox-write",
+          "access": "write"
+        },
+        "mail_move": {
+          "toolset": "mailbox-write",
+          "access": "write"
+        },
+        "mail_send": {
+          "toolset": "mailbox-write",
+          "access": "write"
+        }
+      }
+    },
+    {
+      "type": "connection-provider",
+      "id": "com.mjj3610.mail.connection",
+      "label": "Mail account",
+      "icon": "assets/plugin.svg",
+      "database_type": "mail",
+      "description": "Mail account managed from the DBX connection manager: IMAP/SMTP servers, or Microsoft 365 / Outlook.com (Graph) with browser sign-in inside the plugin, or app-only access (client credentials).",
+      "capabilities": [
+        "test",
+        "connect",
+        "disconnect"
+      ],
+      "workbench": "com.mjj3610.mail.workbench",
+      "fields": [
+        { "key": "kind", "label": "Account type", "type": "select", "binding": "config", "default": "imap", "options": [ { "label": "IMAP / SMTP", "value": "imap" }, { "label": "Microsoft 365 / Outlook.com (Graph)", "value": "graph" } ] },
+        { "key": "display_name", "label": "Connection name", "type": "text", "binding": "name", "default": "Mail account" },
+        { "key": "email", "label": "Email address", "type": "text", "binding": "config", "required": true, "description": "Unique identifier of this account inside the plugin." },
+        { "key": "client_id", "label": "Azure client ID", "type": "text", "binding": "config", "required": true, "visible_when": { "field": "kind", "one_of": ["graph"] }, "description": "Application (client) ID from the Azure Portal app registration. The browser authorization happens inside the plugin after connecting." },
+        { "key": "tenant_id", "label": "Azure tenant", "type": "text", "binding": "config", "default": "common", "visible_when": { "field": "kind", "one_of": ["graph"] }, "description": "\"common\" for personal or multi-tenant apps, or your organization tenant ID / domain." },
+        { "key": "auth_mode", "label": "Authorization", "type": "select", "binding": "config", "default": "browser", "visible_when": { "field": "kind", "one_of": ["graph"] }, "options": [ { "label": "Browser sign-in (inside the plugin)", "value": "browser" }, { "label": "App-only (client credentials, background)", "value": "app" } ], "description": "Browser sign-in authorizes interactively inside the plugin workbench. App-only uses client credentials to access the mailbox in the background without any browser interaction." },
+        { "key": "client_secret", "label": "Azure client secret", "type": "password", "binding": "secret", "visible_when": { "all_of": [ { "field": "kind", "one_of": ["graph"] }, { "field": "auth_mode", "one_of": ["app"] } ] }, "description": "Client secret from the Azure Portal app registration (app-only mode). Kept in the host secret store; the plugin holds it in memory only while connected." },
+        { "key": "user_id", "label": "Mailbox user ID", "type": "text", "binding": "config", "visible_when": { "all_of": [ { "field": "kind", "one_of": ["graph"] }, { "field": "auth_mode", "one_of": ["app"] } ] }, "description": "Object ID or UPN of the mailbox this app permission grants access to (app-only mode). Leave empty to use the email address above." },
+        { "key": "host", "label": "IMAP server", "type": "text", "binding": "host", "required": true, "visible_when": { "field": "kind", "one_of": ["imap"] } },
+        { "key": "port", "label": "IMAP port", "type": "number", "binding": "port", "default": 993, "visible_when": { "field": "kind", "one_of": ["imap"] } },
+        { "key": "security", "label": "IMAP encryption", "type": "select", "binding": "config", "default": "tls", "visible_when": { "field": "kind", "one_of": ["imap"] }, "options": [ { "label": "TLS", "value": "tls" }, { "label": "STARTTLS", "value": "starttls" }, { "label": "None", "value": "none" } ] },
+        { "key": "username", "label": "Username", "type": "text", "binding": "username", "required": true, "visible_when": { "field": "kind", "one_of": ["imap"] } },
+        { "key": "password", "label": "Password", "type": "password", "binding": "secret", "required": true, "visible_when": { "field": "kind", "one_of": ["imap"] }, "description": "Kept in the host secret store; the plugin holds it in memory only while connected." },
+        { "key": "smtp_host", "label": "SMTP server", "type": "text", "binding": "config", "required": true, "visible_when": { "field": "kind", "one_of": ["imap"] } },
+        { "key": "smtp_port", "label": "SMTP port", "type": "number", "binding": "config", "default": 465, "visible_when": { "field": "kind", "one_of": ["imap"] } },
+        { "key": "smtp_security", "label": "SMTP encryption", "type": "select", "binding": "config", "default": "tls", "visible_when": { "field": "kind", "one_of": ["imap"] }, "options": [ { "label": "TLS", "value": "tls" }, { "label": "STARTTLS", "value": "starttls" }, { "label": "None", "value": "none" } ] }
+      ]
     }
   ],
   "localizations": {
@@ -39,6 +113,13 @@
         "com.mjj3610.mail.workbench": {
           "label": "邮件",
           "description": "本地优先的多账户邮件工作台：会话列表、阅读器、富文本撰写与离线发件箱。"
+        },
+        "com.mjj3610.mail.mcp": {
+          "description": "面向 AI 的邮件工具：在已保存账户上列出、阅读、标记、移动与发送邮件。"
+        },
+        "com.mjj3610.mail.connection": {
+          "label": "邮件账户",
+          "description": "在 DBX 连接管理器中创建 IMAP/SMTP 或 Microsoft 365（Graph）邮件账户；Graph 支持插件内浏览器授权，或纯后台接入（client_credentials + Client Secret + 用户 ID）。"
         }
       }
     },
@@ -49,6 +130,13 @@
         "com.mjj3610.mail.workbench": {
           "label": "Mail",
           "description": "A local-first multi-account mailbox with conversation view, reader, rich composer and offline outbox."
+        },
+        "com.mjj3610.mail.mcp": {
+          "description": "AI-facing mail tools: list, read, flag, move and send messages over the plugin's own accounts."
+        },
+        "com.mjj3610.mail.connection": {
+          "label": "Mail account",
+          "description": "Create IMAP/SMTP or Microsoft 365 (Graph) mail accounts from the DBX connection manager; Graph supports in-plugin browser sign-in or app-only access (client credentials with client secret and mailbox user ID)."
         }
       }
     }

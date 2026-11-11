@@ -6,14 +6,17 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use rusqlite::params;
 
 use crate::db;
+use crate::graph;
 use crate::imap::{ImapClient, Login, RemoteHeader};
 use crate::mime::{self, ParseContext};
 use crate::model::{Account, MessageDetail, OutboxItem, SyncReport};
 use crate::smtp::{self, Outgoing, SmtpLogin};
 use crate::App;
+use serde_json::Value;
 
 /// 同步选项
 #[derive(Debug, Clone, Default)]
@@ -33,6 +36,10 @@ pub async fn sync_account(app: Arc<App>, account_id: i64, options: SyncOptions) 
             .map_err(|error| format!("读取账户失败：{error}"))?
             .ok_or_else(|| "账户不存在".to_string())?
     };
+    // Microsoft 365 / Outlook.com（Graph API）与 IMAP 走完全不同的传输层
+    if account.provider == "graph" {
+        return graph_sync_account(app, account, options).await;
+    }
     let password = app.load_password(account.id)?;
     let login = Login {
         host: account.imap_host.clone(),
@@ -66,6 +73,7 @@ pub async fn sync_account(app: Arc<App>, account_id: i64, options: SyncOptions) 
                 &mailbox.role,
                 mailbox.selectable,
                 index as i64,
+                "",
             ) {
                 report.errors.push(format!("保存文件夹「{}」失败：{error}", mailbox.name));
             }
@@ -376,34 +384,47 @@ pub async fn ensure_body(app: Arc<App>, message_id: i64, allow_network: bool) ->
         if !allow_network {
             return Err("本机没有这封邮件的副本，请联网后重试".into());
         }
-        let (account, mailbox_name) = {
+        let account = {
             let conn = app.db();
-            let account = db::account_get(&conn, summary.account_id)
+            db::account_get(&conn, summary.account_id)
                 .ok()
                 .flatten()
-                .ok_or_else(|| "账户不存在".to_string())?;
-            let mailbox = db::mailbox_get(&conn, summary.mailbox_id)
-                .ok()
-                .flatten()
-                .ok_or_else(|| "文件夹不存在".to_string())?;
-            (account, mailbox.name)
+                .ok_or_else(|| "账户不存在".to_string())?
         };
-        let Some(uid) = summary.uid else {
-            return Err("这是一封本地邮件，没有可下载的服务器副本".into());
+        let raw = if account.provider == "graph" {
+            fetch_raw_graph(&app, &account, message_id).await?
+        } else {
+            let mailbox_name = {
+                let conn = app.db();
+                db::mailbox_get(&conn, summary.mailbox_id)
+                    .ok()
+                    .flatten()
+                    .ok_or_else(|| "文件夹不存在".to_string())?
+                    .name
+            };
+            let Some(uid) = summary.uid else {
+                return Err("这是一封本地邮件，没有可下载的服务器副本".into());
+            };
+            let password = app.load_password(account.id)?;
+            let login = Login {
+                host: account.imap_host.clone(),
+                port: account.imap_port,
+                security: account.imap_security.clone(),
+                username: account.username.clone(),
+                password,
+            };
+            let mut client = ImapClient::open(&login).await?;
+            let raw = client.fetch_raw(&mailbox_name, uid as u32).await?;
+            client.logout().await;
+            raw
         };
-        let password = app.load_password(account.id)?;
-        let login = Login {
-            host: account.imap_host.clone(),
-            port: account.imap_port,
-            security: account.imap_security.clone(),
-            username: account.username.clone(),
-            password,
-        };
-        let mut client = ImapClient::open(&login).await?;
-        let raw = client.fetch_raw(&mailbox_name, uid as u32).await?;
-        client.logout().await;
 
-        let key = uid.to_string();
+        let key = if account.provider == "graph" {
+            let conn = app.db();
+            graph::raw_key(&db::message_remote_id(&conn, message_id).unwrap_or_default())
+        } else {
+            summary.uid.map(|uid| uid.to_string()).unwrap_or_default()
+        };
         let path = crate::files::raw_path(&app.data_dir, account.id, summary.mailbox_id, &key);
         crate::files::write_raw(&path, &raw)?;
         {
@@ -431,6 +452,16 @@ pub async fn ensure_body(app: Arc<App>, message_id: i64, allow_network: bool) ->
         let _ = db::body_save(&conn, message_id, &parsed.text, &parsed.html, &parsed.calendar);
         let _ = db::attachments_replace(&conn, message_id, &parsed.attachments);
         let _ = db::message_mark_body_loaded(&conn, message_id);
+        // 懒加载行补全线程头与真实大小（已有值不覆盖）
+        let _ = db::message_backfill_header(
+            &conn,
+            message_id,
+            &parsed.header.message_id,
+            &parsed.header.in_reply_to,
+            &parsed.header.references,
+            &parsed.header.reply_to,
+            raw.len() as i64,
+        );
         if parsed.header.has_attachments {
             let _ = conn.execute(
                 "UPDATE messages SET has_attachments = 1, snippet = CASE WHEN snippet = '' THEN ?2 ELSE snippet END WHERE id = ?1",
@@ -463,17 +494,37 @@ pub async fn set_flags(
         return Ok(());
     }
     // 先写本地并记待同步，界面立即生效
-    let mut jobs: Vec<(i64, String, Option<i64>)> = Vec::new();
+    #[derive(Clone)]
+    struct FlagJob {
+        account_id: i64,
+        message_id: i64,
+        mailbox_name: String,
+        uid: Option<i64>,
+        provider: String,
+        remote_id: String,
+    }
+    let mut jobs: Vec<FlagJob> = Vec::new();
     {
         let conn = app.db();
         for id in ids {
             let _ = db::message_update_flags(&conn, *id, seen, flagged, answered, true);
-            let located: Option<(i64, String, Option<i64>)> = conn
+            let located: Option<FlagJob> = conn
                 .query_row(
-                    "SELECT m.account_id, mb.name, m.uid FROM messages m
-                     JOIN mailboxes mb ON mb.id = m.mailbox_id WHERE m.id = ?1",
+                    "SELECT m.account_id, mb.name, m.uid, a.provider, m.remote_id FROM messages m
+                     JOIN mailboxes mb ON mb.id = m.mailbox_id
+                     JOIN accounts a ON a.id = m.account_id
+                     WHERE m.id = ?1",
                     params![id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| {
+                        Ok(FlagJob {
+                            account_id: row.get(0)?,
+                            message_id: *id,
+                            mailbox_name: row.get(1)?,
+                            uid: row.get(2)?,
+                            provider: row.get(3)?,
+                            remote_id: row.get(4)?,
+                        })
+                    },
                 )
                 .ok();
             if let Some(job) = located {
@@ -482,13 +533,52 @@ pub async fn set_flags(
         }
     }
 
+    // Graph 账户：按账户分组合并推送（Graph 无 answered 属性，仅本地记录）
+    let mut graph_jobs: std::collections::HashMap<i64, Vec<FlagJob>> = std::collections::HashMap::new();
+    let mut imap_jobs: Vec<FlagJob> = Vec::new();
+    for job in jobs {
+        if job.provider == "graph" {
+            graph_jobs.entry(job.account_id).or_default().push(job);
+        } else {
+            imap_jobs.push(job);
+        }
+    }
+    for (account_id, group) in graph_jobs {
+        let account = {
+            let conn = app.db();
+            db::account_get(&conn, account_id).ok().flatten()
+        };
+        let Some(account) = account else { continue };
+        let push = async {
+            let token = crate::oauth::access_token(&app, &account).await?;
+            let client = graph::GraphClient::new(token, &account.user_id);
+            for job in group {
+                let mut ok = true;
+                if let Some(value) = seen {
+                    ok &= client.set_read(&job.remote_id, value).await.is_ok();
+                }
+                if let Some(value) = flagged {
+                    ok &= client.set_flag(&job.remote_id, value).await.is_ok();
+                }
+                if ok {
+                    let conn = app.db();
+                    let _ = db::pending_flags_clear(&conn, job.message_id);
+                }
+            }
+            Ok::<(), String>(())
+        };
+        if let Err(error) = push.await {
+            eprintln!("[dbx-mail] Graph 旗标推送失败：{error}");
+        }
+    }
+
     // 同一账户同一文件夹只登录一次
     let mut grouped: std::collections::HashMap<(i64, String), Vec<(i64, i64)>> =
         std::collections::HashMap::new();
-    for (account_id, mailbox_name, uid) in jobs {
-        if let Some(uid) = uid {
+    for job in imap_jobs {
+        if let Some(uid) = job.uid {
             grouped
-                .entry((account_id, mailbox_name))
+                .entry((job.account_id, job.mailbox_name))
                 .or_default()
                 .push((uid, 0));
         }
@@ -577,32 +667,41 @@ pub async fn move_messages(app: Arc<App>, ids: &[i64], destination: Destination)
         target_id: i64,
         target_name: String,
         permanent: bool,
+        remote_id: String,
     }
 
     let mut jobs: Vec<Job> = Vec::new();
     {
         let conn = app.db();
         for id in ids {
-            let located: Option<(i64, String, i64, Option<i64>, String)> = conn
+            let located: Option<(i64, String, i64, Option<i64>, String, String)> = conn
                 .query_row(
-                    "SELECT m.account_id, mb.name, mb.id, m.uid, mb.role FROM messages m
+                    "SELECT m.account_id, mb.name, mb.id, m.uid, mb.role, m.remote_id FROM messages m
                      JOIN mailboxes mb ON mb.id = m.mailbox_id WHERE m.id = ?1",
                     params![id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
                 )
                 .ok();
-            let Some((account_id, source_name, source_id, uid, source_role)) = located else { continue };
+            let Some((account_id, source_name, source_id, uid, source_role, remote_id)) = located else { continue };
 
             let target = match &destination {
                 Destination::Mailbox(target_id) => {
-                    let found: Option<(i64, String)> = conn
+                    let found: Option<(i64, String, i64)> = conn
                         .query_row(
-                            "SELECT id, name FROM mailboxes WHERE id = ?1",
+                            "SELECT id, name, account_id FROM mailboxes WHERE id = ?1",
                             params![target_id],
-                            |row| Ok((row.get(0)?, row.get(1)?)),
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                         )
                         .ok();
-                    found.map(|(id, name)| (id, name, false))
+                    // 目的地必须与邮件同账户：Graph/IMAP 都无法跨账户寻址远端文件夹
+                    if let Some((_, name, target_account)) = &found {
+                        if *target_account != account_id {
+                            return Err(format!(
+                                "目标文件夹 {name} 属于其他账户，禁止跨账户移动"
+                            ));
+                        }
+                    }
+                    found.map(|(id, name, _)| (id, name, false))
                 }
                 Destination::Trash => {
                     if source_role == "trash" {
@@ -632,6 +731,7 @@ pub async fn move_messages(app: Arc<App>, ids: &[i64], destination: Destination)
                 target_id,
                 target_name,
                 permanent,
+                remote_id,
             });
         }
     }
@@ -651,6 +751,55 @@ pub async fn move_messages(app: Arc<App>, ids: &[i64], destination: Destination)
             db::account_get(&conn, account_id).ok().flatten()
         };
         let Some(account) = account else { continue };
+        if account.provider == "graph" {
+            // Graph：目标文件夹按 remote_id 寻址；移动会换新 ID，失败必须如实上报
+            let push = async {
+                let token = crate::oauth::access_token(&app, &account).await?;
+                let client = graph::GraphClient::new(token, &account.user_id);
+                let mut failures: Vec<String> = Vec::new();
+                for job in group {
+                    if job.remote_id.is_empty() {
+                        continue;
+                    }
+                    let target_remote = {
+                        let conn = app.db();
+                        db::mailbox_remote_id(&conn, job.target_id).unwrap_or_default()
+                    };
+                    let result = if target_remote.is_empty() {
+                        Err("目标文件夹缺少远端 ID".to_string())
+                    } else if job.permanent {
+                        client.delete_message(&job.remote_id).await.map(|_| String::new())
+                    } else {
+                        client.move_message(&job.remote_id, &target_remote).await
+                    };
+                    match result {
+                        Ok(new_remote_id) => {
+                            let conn = app.db();
+                            if job.permanent {
+                                let _ = db::message_delete(&conn, job.id);
+                            } else {
+                                let _ = db::message_set_mailbox(&conn, job.id, job.target_id);
+                                let _ = db::message_set_remote(&conn, job.id, &new_remote_id);
+                            }
+                        }
+                        Err(error) => failures.push(format!("{}：{}", job.remote_id, error)),
+                    }
+                }
+                if failures.is_empty() {
+                    Ok::<(), String>(())
+                } else {
+                    Err(format!(
+                        "{} 封移动/删除失败，本次按未移动处理：{}",
+                        failures.len(),
+                        failures[0]
+                    ))
+                }
+            };
+            if let Err(error) = push.await {
+                return Err(error);
+            }
+            continue;
+        }
         let password = app.load_password(account.id)?;
         let login = Login {
             host: account.imap_host.clone(),
@@ -720,8 +869,6 @@ pub async fn deliver(app: Arc<App>, item: OutboxItem) -> Result<(), String> {
             .map_err(|error| format!("读取账户失败：{error}"))?
             .ok_or_else(|| "账户不存在".to_string())?
     };
-    let password = app.load_password(account.id)?;
-
     let message_id = format!("{}@dbx-mail", uuid::Uuid::new_v4());
     let outgoing = Outgoing {
         from_name: account.display_name.clone(),
@@ -737,32 +884,40 @@ pub async fn deliver(app: Arc<App>, item: OutboxItem) -> Result<(), String> {
         message_id: message_id.clone(),
     };
 
-    let login = SmtpLogin {
-        host: account.smtp_host.clone(),
-        port: account.smtp_port,
-        security: account.smtp_security.clone(),
-        username: account.username.clone(),
-        password: password.clone(),
-    };
-    let raw = smtp::send(&login, &outgoing).await?;
-
-    // 写入服务器「已发送」，失败不影响投递结果
-    if let Some(sent) = {
-        let conn = app.db();
-        role_mailbox(&conn, account.id, "sent")
-    } {
-        let imap_login = Login {
-            host: account.imap_host.clone(),
-            port: account.imap_port,
-            security: account.imap_security.clone(),
+    if account.provider == "graph" {
+        // Graph 发送：MIME 建草稿保住线程头，send 后自动落 Sent Items，无需本地 append
+        let token = crate::oauth::access_token(&app, &account).await?;
+        let raw = smtp::build(&outgoing)?;
+        graph::GraphClient::new(token, &account.user_id).send_mime(&raw).await?;
+    } else {
+        let password = app.load_password(account.id)?;
+        let login = SmtpLogin {
+            host: account.smtp_host.clone(),
+            port: account.smtp_port,
+            security: account.smtp_security.clone(),
             username: account.username.clone(),
-            password,
+            password: password.clone(),
         };
-        if let Ok(mut client) = ImapClient::open(&imap_login).await {
-            if let Err(error) = client.append(&sent.1, &raw).await {
-                eprintln!("[dbx-mail] 写入已发送失败：{error}");
+        let raw = smtp::send(&login, &outgoing).await?;
+
+        // 写入服务器「已发送」，失败不影响投递结果
+        if let Some(sent) = {
+            let conn = app.db();
+            role_mailbox(&conn, account.id, "sent")
+        } {
+            let imap_login = Login {
+                host: account.imap_host.clone(),
+                port: account.imap_port,
+                security: account.imap_security.clone(),
+                username: account.username.clone(),
+                password,
+            };
+            if let Ok(mut client) = ImapClient::open(&imap_login).await {
+                if let Err(error) = client.append(&sent.1, &raw).await {
+                    eprintln!("[dbx-mail] 写入已发送失败：{error}");
+                }
+                client.logout().await;
             }
-            client.logout().await;
         }
     }
 
@@ -809,4 +964,475 @@ pub async fn test_account(account: &Account, password: &str) -> Result<Vec<Strin
     smtp::test(&smtp_login).await?;
     lines.push(format!("SMTP 连接成功：{}:{}", account.smtp_host, account.smtp_port));
     Ok(lines)
+}
+
+/* ---------------- Graph：Microsoft 365 / Outlook.com ---------------- */
+
+/// Graph 账户同步：文件夹引导 → 各文件夹 delta 增量 → 旗标推送。
+/// 与 IMAP 路径共用同一份本地缓存（mailboxes/messages），下游功能无感知。
+async fn graph_sync_account(app: Arc<App>, account: Account, options: SyncOptions) -> Result<SyncReport, String> {
+    let mut report = SyncReport {
+        account_id: account.id,
+        ..Default::default()
+    };
+    let token = match crate::oauth::access_token(&app, &account).await {
+        Ok(token) => token,
+        Err(error) => {
+            record_failure(&app, account.id, &error);
+            return Err(error);
+        }
+    };
+    let client = graph::GraphClient::new(token, &account.user_id);
+
+    // 文件夹引导：远端结构灌入本地（含 role 映射与 remote_id）
+    let folders = match client.folders().await {
+        Ok(folders) => folders,
+        Err(error) => {
+            record_failure(&app, account.id, &error);
+            return Err(error);
+        }
+    };
+    {
+        let conn = app.db();
+        for (index, folder) in folders.iter().enumerate() {
+            let role = graph::role_of(&folder.well_known, &folder.display_name);
+            let _ = db::mailbox_upsert(
+                &conn,
+                account.id,
+                &folder.path,
+                "/",
+                &role,
+                true,
+                index as i64,
+                &folder.id,
+            );
+        }
+    }
+    report.mailboxes = folders.len() as i64;
+
+    // 与 IMAP 相同的同步范围过滤（主要文件夹 / 全部）
+    let settings = {
+        let conn = app.db();
+        db::load_settings(&conn).unwrap_or_default()
+    };
+    let limit = if options.limit > 0 {
+        options.limit
+    } else {
+        settings.initial_limit.clamp(20, 2000) as usize
+    };
+    let targets: Vec<db::Mailbox> = {
+        let conn = app.db();
+        let all = db::mailbox_list(&conn, account.id).unwrap_or_default();
+        if !options.mailbox_ids.is_empty() {
+            all.into_iter()
+                .filter(|mailbox| options.mailbox_ids.contains(&mailbox.id))
+                .collect()
+        } else {
+            all.into_iter()
+                .filter(|mailbox| match settings.sync_scope.as_str() {
+                    "all" => !matches!(mailbox.role.as_str(), "trash" | "junk" | "all"),
+                    _ => matches!(mailbox.role.as_str(), "inbox" | "sent" | "drafts" | "archive"),
+                })
+                .collect()
+        }
+    };
+
+    // 文件夹级并发（inbox 优先，3 路；SQLite 短持锁，互不影响）
+    let mut targets = targets;
+    targets.sort_by_key(|mailbox| mailbox.role != "inbox");
+    let results: Vec<(String, Result<i64, String>)> = futures_util::stream::iter(targets)
+        .map(|mailbox| {
+            let app = Arc::clone(&app);
+            let client = client.clone();
+            let account = account.clone();
+            async move {
+                let result = graph_sync_mailbox(&app, &client, &account, &mailbox, limit).await;
+                (mailbox.name.clone(), result)
+            }
+        })
+        .buffer_unordered(3)
+        .collect()
+        .await;
+    for (name, result) in results {
+        match result {
+            Ok(new_messages) => report.new_messages += new_messages,
+            Err(error) => report.errors.push(format!("{name}：{error}")),
+        }
+    }
+
+    graph_push_pending(&app, &account).await;
+
+    let now = crate::now_ms();
+    {
+        let conn = app.db();
+        let errors = report.errors.join("；");
+        let _ = db::account_set_sync(&conn, account.id, now, &errors.chars().take(300).collect::<String>());
+        let _ = db::sync_log_append(&conn, account.id, report.errors.is_empty(), if report.errors.is_empty() {
+            "同步完成"
+        } else {
+            &errors
+        });
+    }
+    report.synced_at = now;
+    Ok(report)
+}
+
+/// 同步单个 Graph 文件夹：有 deltaLink 走增量，否则先拉最新 N 封再建基线
+async fn graph_sync_mailbox(
+    app: &Arc<App>,
+    client: &graph::GraphClient,
+    account: &Account,
+    mailbox: &db::Mailbox,
+    limit: usize,
+) -> Result<i64, String> {
+    let remote_id = {
+        let conn = app.db();
+        db::mailbox_remote_id(&conn, mailbox.id).map_err(|error| format!("读取文件夹失败：{error}"))?
+    };
+    if remote_id.is_empty() {
+        return Err("文件夹缺少 Graph 标识，请重新发现文件夹".into());
+    }
+    let delta_link = {
+        let conn = app.db();
+        db::mailbox_delta_link(&conn, mailbox.id).map_err(|error| format!("读取同步游标失败：{error}"))?
+    };
+    let mut new_count = 0i64;
+
+    if delta_link.is_empty() {
+        // 首次：只拉最新 limit 封（与 IMAP 的 last_uid 窗口语义一致）
+        let messages = client.recent_messages(&remote_id, limit).await?;
+        for (index, message) in messages.iter().enumerate() {
+            if graph_store_header(app, account, mailbox.id, message)? {
+                new_count += 1;
+            }
+            app.sync_progress(account.id, &mailbox.name, index as i64 + 1, mailbox.total);
+        }
+    }
+
+    // delta 走一遍：首次建立基线游标，之后纯增量
+    let baseline = delta_link.is_empty();
+    // 基线阶段：跳过比本地最早一封更早的历史（与「首拉 N 封」的范围对齐）
+    let have_local: i64 = if baseline {
+        {
+            let conn = app.db();
+            conn.query_row(
+                "SELECT COALESCE(MIN(date), 0) FROM messages WHERE mailbox_id = ?1",
+                params![mailbox.id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
+        }
+    } else {
+        0
+    };
+
+    let mut page = client.delta_first(&remote_id, if baseline { None } else { Some(delta_link.as_str()) }).await?;
+    let mut pages = 0usize;
+    let mut processed = 0i64;
+    loop {
+        pages += 1;
+        if pages > 1000 {
+            return Err("delta 翻页超过上限，已中止".into());
+        }
+        for message in &page.messages {
+            if message.id.is_empty() {
+                continue;
+            }
+            if message.removed {
+                let conn = app.db();
+                let _ = db::message_delete_by_remote(&conn, account.id, mailbox.id, &message.id);
+                continue;
+            }
+            let known: Option<i64> = {
+                let conn = app.db();
+                conn.query_row(
+                    "SELECT id FROM messages WHERE account_id = ?1 AND mailbox_id = ?2 AND remote_id = ?3",
+                    params![account.id, mailbox.id, message.id],
+                    |row| row.get(0),
+                )
+                .ok()
+            };
+            if let Some(id) = known {
+                graph_apply_delta_flags(&app, id, message);
+            } else {
+                if baseline && have_local > 0 && message.received_ms < have_local {
+                    continue;
+                }
+                if graph_store_header(app, account, mailbox.id, message)? {
+                    new_count += 1;
+                }
+            }
+            processed += 1;
+        }
+        app.sync_progress(account.id, &mailbox.name, processed, mailbox.total);
+        if let Some(next) = page.next_link.clone() {
+            page = client.delta_page(&next).await?;
+            continue;
+        }
+        if let Some(delta) = page.delta_link.clone() {
+            let conn = app.db();
+            let _ = db::mailbox_set_delta_link(&conn, mailbox.id, &delta);
+        }
+        break;
+    }
+
+    // 计数以服务器为准刷新一次
+    if let Ok(folder) = client.folder(&remote_id).await {
+        let conn = app.db();
+        let _ = db::mailbox_set_counts(&conn, mailbox.id, folder.total, folder.unread);
+    }
+    Ok(new_count)
+}
+
+/// 列表直存一封 Graph 邮件（懒加载：delta 列表项已含列表页全部字段，
+/// 正文与附件点开时经 ensure_body 按需补全）；返回是否新邮件
+fn graph_store_header(
+    app: &Arc<App>,
+    account: &Account,
+    mailbox_id: i64,
+    message: &graph::GraphMessage,
+) -> Result<bool, String> {
+    let ctx = ParseContext {
+        account_id: account.id,
+        mailbox_id,
+        uid: None,
+        internal_date: message.received_ms,
+        seen: message.seen,
+        flagged: message.flagged,
+        answered: false,
+        draft: false,
+        size: 0,
+    };
+    let existed: Option<i64> = {
+        let conn = app.db();
+        conn.query_row(
+            "SELECT id FROM messages WHERE account_id = ?1 AND mailbox_id = ?2 AND remote_id = ?3",
+            params![account.id, mailbox_id, message.id],
+            |row| row.get(0),
+        )
+        .ok()
+    };
+    let row = graph_header_row(message, &ctx);
+    db::message_upsert_remote(&app.db(), &row, &message.id)
+        .map_err(|error| format!("保存邮件失败：{error}"))?;
+    {
+        let conn = app.db();
+        if !row.from_addr.is_empty() {
+            let _ = db::contacts_touch(&conn, &row.from_addr, &row.from_name, row.date);
+        }
+    }
+    Ok(existed.is_none())
+}
+
+/// Graph 列表字段 → 本地头部行（懒加载直存；线程键用 conversationId 聚合整个对话）
+fn graph_header_row(message: &graph::GraphMessage, ctx: &ParseContext) -> db::HeaderRow {
+    let thread_id = if !message.conversation_id.is_empty() {
+        format!("g:c:{}", message.conversation_id)
+    } else if !message.id.is_empty() {
+        format!("g:{}", message.id)
+    } else {
+        uuid::Uuid::new_v4().simple().to_string()
+    };
+    db::HeaderRow {
+        account_id: ctx.account_id,
+        mailbox_id: ctx.mailbox_id,
+        uid: None,
+        message_id: String::new(),
+        thread_id,
+        subject: if message.subject.trim().is_empty() {
+            "(无主题)".to_string()
+        } else {
+            message.subject.clone()
+        },
+        from_name: message.from_name.clone(),
+        from_addr: message.from_addr.clone(),
+        to_addrs: message.to_addrs.clone(),
+        cc_addrs: message.cc_addrs.clone(),
+        reply_to: String::new(),
+        in_reply_to: String::new(),
+        references: Vec::new(),
+        date: message.received_ms,
+        internal_date: message.received_ms,
+        size: ctx.size,
+        snippet: message.preview.clone(),
+        seen: message.seen,
+        flagged: message.flagged,
+        answered: false,
+        draft: false,
+        has_attachments: message.has_attachments,
+    }
+}
+
+/// delta 带回的旗标覆盖本地；本地有未推送改动（pending_flags）时以本地为准
+fn graph_apply_delta_flags(app: &Arc<App>, message_id: i64, message: &graph::GraphMessage) {
+    let conn = app.db();
+    let _ = conn.execute(
+        "UPDATE messages SET seen = ?2, flagged = ?3
+         WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM pending_flags WHERE message_id = ?1)",
+        params![message_id, message.seen, message.flagged],
+    );
+}
+
+/// 把本地待推送的旗标打到 Graph（上次网络失败遗留的 pending_flags）
+async fn graph_push_pending(app: &Arc<App>, account: &Account) {
+    let pending: Vec<(i64, Option<bool>, Option<bool>)> = {
+        let conn = app.db();
+        let mut stmt = match conn.prepare(
+            "SELECT pf.message_id, pf.seen, pf.flagged FROM pending_flags pf
+             JOIN messages m ON m.id = pf.message_id WHERE m.account_id = ?1",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return,
+        };
+        let rows = stmt.query_map(params![account.id], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        });
+        match rows {
+            Ok(rows) => rows.filter_map(Result::ok).collect(),
+            Err(_) => Vec::new(),
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let Ok(token) = crate::oauth::access_token(app, account).await else {
+        return;
+    };
+    let client = graph::GraphClient::new(token, &account.user_id);
+    for (message_id, seen, flagged) in pending {
+        let remote_id = {
+            let conn = app.db();
+            db::message_remote_id(&conn, message_id).unwrap_or_default()
+        };
+        if remote_id.is_empty() {
+            continue;
+        }
+        let mut ok = true;
+        if let Some(value) = seen {
+            ok &= client.set_read(&remote_id, value).await.is_ok();
+        }
+        if let Some(value) = flagged {
+            ok &= client.set_flag(&remote_id, value).await.is_ok();
+        }
+        if ok {
+            let conn = app.db();
+            let _ = db::pending_flags_clear(&conn, message_id);
+        }
+    }
+}
+
+/// 按需下载 Graph 邮件原文（正文缓存缺失时）
+async fn fetch_raw_graph(app: &Arc<App>, account: &Account, message_id: i64) -> Result<Vec<u8>, String> {
+    let remote_id = {
+        let conn = app.db();
+        db::message_remote_id(&conn, message_id).map_err(|error| format!("读取邮件失败：{error}"))?
+    };
+    if remote_id.is_empty() {
+        return Err("这是一封本地邮件，没有可下载的服务器副本".into());
+    }
+    let token = crate::oauth::access_token(app, account).await?;
+    graph::GraphClient::new(token, &account.user_id).raw_message(&remote_id).await
+}
+
+/// Graph 账户文件夹发现（新增账户后 / 手动重试）
+pub fn graph_discover(app: Arc<App>, account: &Account) -> Result<(), String> {
+    let result = app.rt.block_on(async {
+        let token = crate::oauth::access_token(&app, account).await?;
+        let client = graph::GraphClient::new(token, &account.user_id);
+        client
+            .folders()
+            .await
+            .map(|folders| {
+                let conn = app.db();
+                for (index, folder) in folders.iter().enumerate() {
+                    let role = graph::role_of(&folder.well_known, &folder.display_name);
+                    if let Ok(id) = db::mailbox_upsert(
+                        &conn,
+                        account.id,
+                        &folder.display_name,
+                        "/",
+                        &role,
+                        true,
+                        index as i64,
+                        &folder.id,
+                    ) {
+                        let _ = db::mailbox_set_counts(&conn, id, folder.total, folder.unread);
+                    }
+                }
+            })
+            .map_err(|error| error)
+    });
+    result
+}
+
+/// Graph 账户连接检测（授权有效性 + 文件夹可见性）
+pub fn test_account_graph(app: Arc<App>, account: &Account) -> Result<Vec<String>, String> {
+    app.rt.block_on(async {
+        let token = crate::oauth::access_token(&app, account).await?;
+        let client = graph::GraphClient::new(token, &account.user_id);
+        let me = client.me().await?;
+        let name = me
+            .get("displayName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let user = me
+            .get("userPrincipalName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let folders = client.folders().await?;
+        let inbox = folders.iter().find(|folder| folder.well_known == "inbox");
+        let mut lines = vec![format!("Graph 授权有效：{name} <{user}>")];
+        lines.push(format!("发现 {} 个文件夹", folders.len()));
+        if let Some(inbox) = inbox {
+            lines.push(format!("收件箱 {} 封，未读 {} 封", inbox.total, inbox.unread));
+        }
+        Ok(lines)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn graph_message(conversation_id: &str) -> graph::GraphMessage {
+        graph::GraphMessage {
+            id: "msg-1".into(),
+            conversation_id: conversation_id.into(),
+            subject: "  ".into(),
+            from_name: "张三".into(),
+            from_addr: "z@x.com".into(),
+            ..Default::default()
+        }
+    }
+
+    fn parse_ctx() -> ParseContext {
+        ParseContext {
+            account_id: 1,
+            mailbox_id: 2,
+            uid: None,
+            internal_date: 0,
+            seen: false,
+            flagged: false,
+            answered: false,
+            draft: false,
+            size: 0,
+        }
+    }
+
+    #[test]
+    fn graph_header_row_threads_by_conversation() {
+        let row = graph_header_row(&graph_message("conv-9"), &parse_ctx());
+        assert_eq!(row.thread_id, "g:c:conv-9");
+        assert_eq!(row.subject, "(无主题)");
+        assert_eq!(row.from_addr, "z@x.com");
+        assert_eq!(row.message_id, "");
+    }
+
+    #[test]
+    fn graph_header_row_falls_back_to_message_id_thread() {
+        let row = graph_header_row(&graph_message(""), &parse_ctx());
+        assert_eq!(row.thread_id, "g:msg-1");
+    }
 }

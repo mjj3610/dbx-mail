@@ -64,6 +64,24 @@ export function hostLocale(): string {
   return raw.startsWith('zh') ? 'zh-CN' : 'en'
 }
 
+/**
+ * 宿主工作台下发的连接上下文：connection-provider 打开的 tab 携带 connectionId，
+ * 用于「一个连接一个邮箱」的作用域模式；独立打开（插件中心等）返回空串。
+ */
+export function hostConnectionId(): string {
+  const value = bridge()?.context?.connectionId
+  return typeof value === 'string' ? value : ''
+}
+
+/**
+ * 订阅宿主 init：context 经 postMessage init 下发，可能晚于插件启动
+ * （宿主等 iframe ready 后才发 init）。返回退订函数。
+ */
+export function onHostInit(handler: () => void): () => void {
+  const off = bridge()?.onInit?.(() => handler())
+  return off ?? (() => {})
+}
+
 /** 监听宿主外观变化 */
 export function watchHostAppearance(onChange: () => void): () => void {
   if (typeof MutationObserver === 'undefined') return () => {}

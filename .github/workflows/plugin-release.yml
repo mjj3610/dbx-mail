@@ -40,9 +40,6 @@ jobs:
         fi
         npm ci --no-audit --no-fund
         npm run build
-        # backend/rust-toolchain.toml 固定了 windows-gnu（本机 link.exe 被 Git 的 link 抢占），
-        # CI 里必须用宿主原生工具链，否则会去装一个对当前宿主非法的 toolchain。
-        export RUSTUP_TOOLCHAIN=stable
         ( cd backend && cargo build --release --locked )
         node scripts/package.mjs --output-dir dist
       package-path: dist/*.dbxp

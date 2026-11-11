@@ -190,11 +190,20 @@ export function ThreadList() {
           </button>
           <button
             className="cap-btn"
-            title={t(locale, 'action.sync')}
+            title={
+              mail.syncing && mail.progress
+                ? `${mail.progress.mailbox} ${mail.progress.done}/${mail.progress.total}`
+                : t(locale, 'action.sync')
+            }
             onClick={() => void mail.sync(currentMailboxId())}
             disabled={mail.syncing}
           >
             {mail.syncing ? <Loader2 size={15} className="spin" /> : <RefreshCw size={15} />}
+            {mail.syncing && mail.progress && mail.progress.total > 0 && (
+              <span style={{ marginLeft: 6, fontSize: 12 }}>
+                {mail.progress.done}/{mail.progress.total}
+              </span>
+            )}
           </button>
           <span className="cap-sep" />
           <div style={{ position: 'relative' }} ref={menuRef}>

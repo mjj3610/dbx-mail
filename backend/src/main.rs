@@ -12,17 +12,21 @@ mod accounts;
 mod compose;
 mod db;
 mod files;
+mod graph;
+mod hostconn;
 mod imap;
+mod mcp;
 mod mime;
 mod model;
 mod net_guard;
+mod oauth;
 mod secrets;
 mod smtp;
 mod stream;
 mod sync;
 mod tls;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -53,8 +57,14 @@ pub struct App {
     pub secrets: secrets::SecretStore,
     /// 网络任务运行时
     pub rt: tokio::runtime::Runtime,
-    /// 正在同步的账户，避免重入
-    pub syncing: Mutex<HashSet<i64>>,
+    /// 正在同步的账户与进度，避免重入
+    pub syncing: SyncRegistry,
+    /// Graph 账户的 access_token 缓存（不落盘）
+    pub token_cache: oauth::TokenCache,
+    /// 进行中的 OAuth 授权（state → 上下文）
+    pub oauth_pending: oauth::PendingMap,
+    /// DBX 宿主连接（connection-provider）的活跃会话；密码只在内存，不落盘
+    pub host_sessions: Mutex<HashMap<String, hostconn::HostSession>>,
 }
 
 impl App {
@@ -65,6 +75,10 @@ impl App {
 
     /// 读取账户密码
     pub fn load_password(&self, account_id: i64) -> Result<String, String> {
+        // 宿主连接（connection-provider）的密码只在内存会话里，优先于本地密钥库
+        if let Some(password) = hostconn::session_password(self, account_id) {
+            return Ok(password);
+        }
         let reference = {
             let conn = self.db();
             db::account_password_ref(&conn, account_id)
@@ -80,13 +94,63 @@ impl App {
 
     /// 尝试占用同步槽位
     fn begin_sync(&self, account_id: i64) -> bool {
-        let mut set = self.syncing.lock().unwrap_or_else(|error| error.into_inner());
-        set.insert(account_id)
+        self.syncing.begin(account_id)
     }
 
     fn end_sync(&self, account_id: i64) {
-        let mut set = self.syncing.lock().unwrap_or_else(|error| error.into_inner());
-        set.remove(&account_id);
+        self.syncing.finish(account_id);
+    }
+
+    /// 汇报同步进度（当前文件夹 + 已处理/总数）
+    pub fn sync_progress(&self, account_id: i64, mailbox: &str, done: i64, total: i64) {
+        self.syncing.update(account_id, mailbox, done, total);
+    }
+}
+
+/// 正在同步的账户与进度（begin 返回 false 表示该账户已在同步中）
+pub struct SyncRegistry {
+    inner: Mutex<HashMap<i64, model::SyncProgress>>,
+}
+
+impl SyncRegistry {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn begin(&self, account_id: i64) -> bool {
+        let mut map = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        map.insert(
+            account_id,
+            model::SyncProgress {
+                account_id,
+                ..Default::default()
+            },
+        )
+        .is_none()
+    }
+
+    pub fn finish(&self, account_id: i64) {
+        let mut map = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        map.remove(&account_id);
+    }
+
+    pub fn update(&self, account_id: i64, mailbox: &str, done: i64, total: i64) {
+        let mut map = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(progress) = map.get_mut(&account_id) {
+            progress.mailbox = mailbox.to_string();
+            progress.done = done;
+            progress.total = total;
+        }
+    }
+
+    /// 进度快照（按账户 id 排序）
+    pub fn snapshot(&self) -> Vec<model::SyncProgress> {
+        let map = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        let mut list: Vec<_> = map.values().cloned().collect();
+        list.sort_by_key(|progress| progress.account_id);
+        list
     }
 }
 
@@ -174,7 +238,10 @@ fn main() {
         db: Mutex::new(conn),
         secrets,
         rt: runtime,
-        syncing: Mutex::new(HashSet::new()),
+        syncing: SyncRegistry::new(),
+        token_cache: Mutex::new(HashMap::new()),
+        oauth_pending: Mutex::new(HashMap::new()),
+        host_sessions: Mutex::new(HashMap::new()),
     });
 
     start_workers(app.clone());
@@ -208,46 +275,55 @@ fn start_workers(app: Arc<App>) {
         });
     }
 
-    // 定时同步（只看收件箱与已发送，完整同步由用户手动触发）
+    // 定时同步：启动先立即跑一轮（打开即同步），之后每 45s 检查、按间隔触发；
+    // 平时只看收件箱与已发送，完整同步由用户手动触发
     {
         let app = Arc::clone(&app);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(45));
-            let (accounts, interval) = {
-                let conn = app.db();
-                let settings = db::load_settings(&conn).unwrap_or_default();
-                (db::account_list(&conn).unwrap_or_default(), settings.sync_interval)
-            };
-            if interval <= 0 {
-                continue;
-            }
-            let now = now_ms();
-            for account in accounts {
-                if !account.sync_enabled || account.sync_interval <= 0 {
-                    continue;
+        std::thread::spawn(move || {
+            let mut rounds = 0u64;
+            loop {
+                let startup_round = rounds == 0;
+                if !startup_round {
+                    std::thread::sleep(Duration::from_secs(45));
                 }
-                let period = account.sync_interval.max(1) * 60_000;
-                if account.last_sync_at > 0 && now - account.last_sync_at < period {
-                    continue;
-                }
-                if !app.begin_sync(account.id) {
-                    continue;
-                }
-                let mailbox_ids = {
+                rounds += 1;
+                let (accounts, interval) = {
                     let conn = app.db();
-                    accounts::mailbox_ids_for(&conn, account.id, &["inbox", "sent"])
+                    let settings = db::load_settings(&conn).unwrap_or_default();
+                    (db::account_list(&conn).unwrap_or_default(), settings.sync_interval)
                 };
-                let report = app.rt.block_on(sync::sync_account(
-                    Arc::clone(&app),
-                    account.id,
-                    sync::SyncOptions {
-                        mailbox_ids,
-                        limit: 30,
-                    },
-                ));
-                app.end_sync(account.id);
-                if let Err(error) = report {
-                    eprintln!("[dbx-mail] 后台同步失败（账户 {}）：{error}", account.id);
+                if interval <= 0 {
+                    continue;
+                }
+                let now = now_ms();
+                for account in accounts {
+                    if !account.sync_enabled || account.sync_interval <= 0 {
+                        continue;
+                    }
+                    let period = account.sync_interval.max(1) * 60_000;
+                    // 启动首轮豁免到期检查，其余轮次按间隔
+                    if !startup_round && account.last_sync_at > 0 && now - account.last_sync_at < period {
+                        continue;
+                    }
+                    if !app.begin_sync(account.id) {
+                        continue;
+                    }
+                    let mailbox_ids = {
+                        let conn = app.db();
+                        accounts::mailbox_ids_for(&conn, account.id, &["inbox", "sent"])
+                    };
+                    let report = app.rt.block_on(sync::sync_account(
+                        Arc::clone(&app),
+                        account.id,
+                        sync::SyncOptions {
+                            mailbox_ids,
+                            limit: 30,
+                        },
+                    ));
+                    app.end_sync(account.id);
+                    if let Err(error) = report {
+                        eprintln!("[dbx-mail] 后台同步失败（账户 {}）：{error}", account.id);
+                    }
                 }
             }
         });
@@ -353,7 +429,7 @@ fn dispatch(app: &Arc<App>, method: &str, params: &Value) -> RpcResult {
         "ping" => Ok(json!({ "ok": true, "version": PLUGIN_VERSION })),
 
         // 初始化数据
-        "app/bootstrap" => bootstrap(app),
+        "app/bootstrap" => bootstrap(app, params),
         "app/info" => Ok(json!({
             "version": PLUGIN_VERSION,
             "dataDir": app.data_dir.to_string_lossy(),
@@ -375,6 +451,58 @@ fn dispatch(app: &Arc<App>, method: &str, params: &Value) -> RpcResult {
             let id = param_int(params, "id", 0);
             Ok(accounts::discover(Arc::clone(app), id)?)
         }
+        // 宿主连接作用域：connectionId → 绑定的账户（宿主工作台按连接独立邮箱）
+        "account/byConnection" => {
+            let connection_id = param_str(params, "connectionId");
+            if connection_id.trim().is_empty() {
+                return Err(RpcError::invalid("缺少 connectionId"));
+            }
+            let conn = app.db();
+            let account = db::account_by_host(&conn, connection_id.trim())
+                .map_err(|error| RpcError::invalid(&format!("读取账户失败：{error}")))?;
+            Ok(json!({ "account": account }))
+        }
+
+        // OAuth 授权（Microsoft 365 / Outlook.com）
+        "account/oauthBegin" => {
+            let tenant = param_str(params, "tenantId");
+            let client = param_str(params, "clientId");
+            // 机密客户端：回调时的 code 交换需要 client_secret（仅驻内存）
+            let mut secret = param_str(params, "clientSecret");
+            if secret.trim().is_empty() {
+                // 重新授权场景：前端拿不到（也不该拿到）存量 secret，按账户从
+                // SecretStore 取回注入 pending，否则机密客户端的 code 交换必被拒
+                let account_id = param_int(params, "accountId", 0);
+                if account_id > 0 {
+                    let conn = app.db();
+                    if let Ok(Some(row)) = db::account_get(&conn, account_id) {
+                        if row.provider == "graph" {
+                            if let Ok(stored) = app.secrets.load(&format!("graphsecret:{}", row.email)) {
+                                secret = stored;
+                            }
+                        }
+                    }
+                }
+            }
+            if client.trim().is_empty() {
+                return Err(RpcError::invalid("请填写 Azure 应用的 Client ID"));
+            }
+            let app = Arc::clone(app);
+            let (url, state) = app
+                .rt
+                .block_on(oauth::begin(&app, &tenant, &client, &secret))
+                .map_err(RpcError::internal)?;
+            Ok(json!({ "authorizeUrl": url, "state": state, "expiresIn": 300 }))
+        }
+        "account/oauthStatus" => {
+            let state = param_str(params, "state");
+            oauth::status(app, &state).map_err(RpcError::internal)
+        }
+        "account/oauthCancel" => {
+            let state = param_str(params, "state");
+            oauth::cancel(app, &state);
+            Ok(json!({ "ok": true }))
+        }
 
         // 文件夹
         "mailbox/list" => {
@@ -392,16 +520,12 @@ fn dispatch(app: &Arc<App>, method: &str, params: &Value) -> RpcResult {
         // 同步
         "sync/now" => sync_now(app, params),
         "sync/status" => {
-            let running: Vec<i64> = app
-                .syncing
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .iter()
-                .copied()
-                .collect();
+            let progress = app.syncing.snapshot();
+            let running: Vec<i64> = progress.iter().map(|item| item.account_id).collect();
             let conn = app.db();
             Ok(json!({
                 "running": running,
+                "progress": progress,
                 "log": db::sync_log_list(&conn, 40)?,
             }))
         }
@@ -526,6 +650,15 @@ fn dispatch(app: &Arc<App>, method: &str, params: &Value) -> RpcResult {
             Ok(json!({ "path": path }))
         }
 
+        // MCP 工具面（内置 AI / 外部 dbx MCP；sidecar-protocol §9）
+        "mcp/tools" => Ok(mcp::tool_definitions()),
+        "mcp/call" => mcp::call(app, params),
+
+        // DBX 宿主连接管理（connection-provider；生命周期 Secret 不落盘）
+        "connection/test" => Ok(hostconn::test(Arc::clone(app), params)),
+        "connection/connect" => Ok(hostconn::connect(Arc::clone(app), params)?),
+        "connection/disconnect" => Ok(hostconn::disconnect(Arc::clone(app), params)?),
+
         other => Err(RpcError::new(-32601, format!("未实现的方法：{other}"))),
     }
 }
@@ -533,39 +666,49 @@ fn dispatch(app: &Arc<App>, method: &str, params: &Value) -> RpcResult {
 /* ---------------- 具体处理 ---------------- */
 
 /// 首屏数据：账户、文件夹、设置、计数
-fn bootstrap(app: &Arc<App>) -> RpcResult {
+fn bootstrap(app: &Arc<App>, params: &Value) -> RpcResult {
     let conn = app.db();
-    let accounts = db::account_list(&conn)?;
+    // 宿主连接作用域：accountId > 0 时只返回该账户的元数据与计数（独立邮箱 tab）
+    let scope_account = param_int(params, "accountId", 0);
+    let accounts = if scope_account > 0 {
+        db::account_get(&conn, scope_account)?
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        db::account_list(&conn)?
+    };
     let settings = db::load_settings(&conn)?;
     let mut mailboxes = Vec::new();
     for account in &accounts {
         mailboxes.extend(db::mailbox_list(&conn, account.id)?);
     }
-    let inbox_unread: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(unread), 0) FROM mailboxes WHERE role = 'inbox'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let starred: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM messages m JOIN mailboxes mb ON mb.id = m.mailbox_id
+    // 作用域计数：纯后台 scoped 时按账户过滤；多表查询用表别名限定列
+    let count = |sql_all: &'static str, sql_scoped: &'static str| -> i64 {
+        if scope_account > 0 {
+            conn.query_row(sql_scoped, rusqlite::params![scope_account], |row| row.get(0))
+                .unwrap_or(0)
+        } else {
+            conn.query_row(sql_all, [], |row| row.get(0)).unwrap_or(0)
+        }
+    };
+    let inbox_unread: i64 = count(
+        "SELECT COALESCE(SUM(unread), 0) FROM mailboxes WHERE role = 'inbox'",
+        "SELECT COALESCE(SUM(unread), 0) FROM mailboxes WHERE role = 'inbox' AND mailboxes.account_id = ?1",
+    );
+    let starred: i64 = count(
+        "SELECT COUNT(*) FROM messages m JOIN mailboxes mb ON mb.id = m.mailbox_id
              WHERE m.flagged = 1 AND mb.role NOT IN ('trash','junk')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let drafts: i64 = conn
-        .query_row("SELECT COUNT(*) FROM drafts", [], |row| row.get(0))
-        .unwrap_or(0);
-    let outbox: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM outbox WHERE status IN ('queued','sending','failed')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+        "SELECT COUNT(*) FROM messages m JOIN mailboxes mb ON mb.id = m.mailbox_id
+             WHERE m.flagged = 1 AND mb.role NOT IN ('trash','junk') AND m.account_id = ?1",
+    );
+    let drafts: i64 = count(
+        "SELECT COUNT(*) FROM drafts",
+        "SELECT COUNT(*) FROM drafts WHERE drafts.account_id = ?1",
+    );
+    let outbox: i64 = count(
+        "SELECT COUNT(*) FROM outbox WHERE status IN ('queued','sending','failed')",
+        "SELECT COUNT(*) FROM outbox WHERE status IN ('queued','sending','failed') AND outbox.account_id = ?1",
+    );
 
     Ok(json!({
         "version": PLUGIN_VERSION,
@@ -929,4 +1072,34 @@ fn param_i64_array(params: &Value, key: &str) -> Vec<i64> {
 /// 当前毫秒时间戳
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+#[cfg(test)]
+mod sync_registry_tests {
+    use super::*;
+
+    #[test]
+    fn registry_begin_guards_and_finish_frees_slot() {
+        let registry = SyncRegistry::new();
+        assert!(registry.begin(1));
+        assert!(!registry.begin(1));
+        registry.update(1, "收件箱", 10, 100);
+        registry.finish(1);
+        assert!(registry.begin(1));
+    }
+
+    #[test]
+    fn registry_snapshot_reports_progress() {
+        let registry = SyncRegistry::new();
+        registry.begin(7);
+        registry.update(7, "Inbox", 3, 50);
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].account_id, 7);
+        assert_eq!(snapshot[0].mailbox, "Inbox");
+        assert_eq!(snapshot[0].done, 3);
+        assert_eq!(snapshot[0].total, 50);
+        registry.finish(7);
+        assert!(registry.snapshot().is_empty());
+    }
 }

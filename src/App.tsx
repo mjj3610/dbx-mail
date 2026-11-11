@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { AlertTriangle, Loader2, Mail, Plus, RefreshCw } from 'lucide-react'
 import { Toaster } from 'sonner'
-import { bridge, awaitHostReady, hostAppearance, watchHostAppearance } from './lib/bridge'
+import { bridge, awaitHostReady, hostAppearance, watchHostAppearance, onHostInit } from './lib/bridge'
 import { t } from './lib/i18n'
 import { useMail } from './stores/mail'
 import { useUI } from './stores/ui'
@@ -22,14 +22,21 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false
+    // 先订阅宿主 init：context 经 postMessage 下发，可能晚于插件启动
+    const offHostInit = onHostInit(() => {
+      if (!cancelled) void useMail.getState().applyConnectionScope()
+    })
     void (async () => {
       await awaitHostReady()
       if (cancelled) return
       await useMail.getState().init()
+      // init 里已读过一次 context；若宿主 init 尚未到达，onInit 回调兜底
+      await useMail.getState().applyConnectionScope()
       setBooted(true)
     })()
     return () => {
       cancelled = true
+      offHostInit()
     }
   }, [])
 

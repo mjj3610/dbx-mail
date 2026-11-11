@@ -2,6 +2,7 @@
  * 滚动与横向裁切检查：窄窗口打开「固定 700px 宽 + body{overflow:hidden}」的营销邮件模板
  * 断言：阅读区能纵向滚动到底、正文不被左右裁掉、邮件区域自身有横向滚动兜底
  */
+import { fileURLToPath } from 'node:url'
 import { chromium, executablePath } from './browser.mjs'
 
 const exe = executablePath

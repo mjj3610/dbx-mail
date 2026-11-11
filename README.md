@@ -21,9 +21,10 @@
 
 | 模块 | 能力 |
 | --- | --- |
-| 账户 | IMAP/SMTP 多账户；8 种服务商预设（Gmail / Outlook / QQ / 腾讯企业邮 / 163 / 阿里云 / iCloud / Yahoo）按域名自动填服务器；手动改 host/port/加密方式；添加前测试连接；文件夹发现 |
+| 账户 | IMAP/SMTP 多账户；8 种服务商预设（Gmail / Outlook / QQ / 腾讯企业邮 / 163 / 阿里云 / iCloud / Yahoo）按域名自动填服务器；手动改 host/port/加密方式；添加前测试连接；文件夹发现；**Microsoft 365 / Outlook.com 走 Graph API**（见下节）；**DBX 连接管理器可直接建邮件账户**（IMAP/SMTP 或 Graph 壳，见 §1.3） |
+| AI 工具 | MCP 工具面：`mail_list` / `mail_read` / `mail_flag` / `mail_move` / `mail_send`（dryRun 两阶段）/ `folder_list`，进入内置 AI 与外部 dbx MCP 服务（见 §1.2） |
 | 密码 | 系统凭据库（Windows Credential Manager / macOS Keychain / Secret Service）；不可用时退化为 AES-256-GCM 本地加密文件（`secrets.key` + `secrets.bin`，Unix 0600） |
-| 同步 | IMAP 增量同步：`UIDVALIDITY` 变化时重置文件夹、按 `last_uid` 拉新头、旗标双向同步（`pending_flags` 表避免服务器覆盖本地改动）；同步范围可选「主要文件夹 / 全部」；启动 45 秒巡检、可手动同步、可关自动同步 |
+| 同步 | IMAP 增量同步：`UIDVALIDITY` 变化时重置文件夹、按 `last_uid` 拉新头、旗标双向同步（`pending_flags` 表避免服务器覆盖本地改动）；Graph 账户按 `deltaLink` 增量、旗标/移动/删除直推；同步范围可选「主要文件夹 / 全部」；启动 45 秒巡检、可手动同步、可关自动同步 |
 | 会话列表 | 按 `References`/`In-Reply-To`/`Message-ID` 归并会话，会话内计数与未读聚合；过滤（全部 / 未读 / 星标 / 附件）；跨账户「所有收件箱」；搜索主题、摘要、发件人、收件人与正文全文；分页加载 |
 | 阅读器 | 会话内多封邮件折叠展开；正文由 `mail-parser` 解析后本地渲染；HTML 先经 DOMPurify 白名单清洗；**远程图片默认不加载**——挂载前就把 `src` 换成占位，不会自动向图床发起任何请求；用户点「显示图片」后由本地后端代理取回并转 data URL（SSRF 白名单 + 逐跳重定向复核，拒绝环回、内网与 CGNAT） |
 | 附件 | 解析 `mail-parser` 的部件索引，按需从原始邮件取字节；保存时自绘目录选择器选目录、同名自动加序号不覆盖；25 MB 单文件上限（`mail/part` 30 MB） |
@@ -37,6 +38,78 @@
 
 ![阅读器](screenshots/02-reader.png)
 
+## 1.1 Microsoft 365 / Outlook.com（Graph API）
+
+微软已对 Microsoft 365 与 Outlook.com 停用 IMAP/SMTP 基本认证，纯密码登录不可用。
+此场景走 **Microsoft Graph REST**（与 IMAP 账户共用同一份本地缓存，会话、搜索、
+阅读、附件、草稿、发件箱体验一致）。**两种接入方式**（向导里选择）：
+
+- **浏览器授权（推荐）**：OAuth2 授权码 + PKCE，sidecar 在 `127.0.0.1` 随机端口
+  接收回调；refresh_token 存系统凭据库（同密码通道），access_token 只驻内存并
+  到期自动刷新。
+- **纯后台接入（client_credentials）**：无需浏览器交互——Azure 应用配置
+  Mail.ReadWrite、Mail.Send、User.Read 的**「应用程序」权限并完成管理员同意**后，
+  填 Client Secret + 目标邮箱（userId），插件直接以应用令牌访问该邮箱
+  （Graph `/users/{id}/...`）。适合服务器/无人值守场景；应用令牌无 refresh_token，
+  过期自动重取，Secret 只存系统凭据库（引用列在本地 SQLite，不含明文）。
+  机密客户端也可在浏览器授权模式下填写 Client Secret（token 交换与刷新携带）。
+- **自备 Azure 应用**：授权使用你自己在 Azure Portal 注册的应用（公共客户端，无 secret）：
+
+  1. 登录 [portal.azure.com](https://portal.azure.com) → Microsoft Entra ID → 应用注册 → 新注册；
+  2. 受支持账户类型选「任何组织目录中的账户和个人 Microsoft 账户」；
+  3. 重定向 URI：平台选「移动和桌面应用程序」，填 `http://localhost`（不带端口）；
+  4. API 权限 → Microsoft Graph → 委托权限：`offline_access`、`Mail.ReadWrite`、`Mail.Send`、`User.Read`；
+     受限租户可能需要管理员同意；
+  5. 把「应用程序(客户端) ID」填入插件向导，租户填 `common`（或组织租户 GUID），点「授权并添加」。
+
+- **同步**：文件夹 `wellKnownFolderName` 映射本地角色；邮件取完整 MIME
+  （`/messages/{id}/$value`）复用同一解析管线；增量用 `messages/delta`，
+  deltaLink 断链自动重建。
+- **发送**：MIME 建草稿 + send，保留 `Message-ID` / `References` / `In-Reply-To`
+  线程头，发送后自动落「已发送」；超大附件（>4MB）自动回退 JSON + 上传会话分片。
+
+## 1.2 AI 工具（MCP）
+
+插件通过 `mcp` 贡献点把邮件能力暴露给 DBX 内置 AI 与外部 `dbx` MCP 服务
+（`external_tools: true`，工具分 `mailbox-read` / `mailbox-write` 两个工具集）。
+`mcp/tools` 只做发现（无副作用），`mcp/call` 逐参数校验后复用 Sidecar 内部引擎：
+
+| 工具 | 读写 | 说明 |
+| --- | --- | --- |
+| `folder_list` | read | 列出某账户全部文件夹与计数 |
+| `mail_list` | read | 按文件夹/关键词列会话，`cursor`（`o<offset>`）+ `limit`（1-50）分页 |
+| `mail_read` | read | 按消息或会话 id 返回纯文本正文（正文缺省时自动 HTML 转文本；按需取正文可走网络） |
+| `mail_flag` | write | 设置/清除 已读、星标、已答复 |
+| `mail_move` | write | 按角色名或文件夹 id 移动邮件（默认归档） |
+| `mail_send` | write | 发送邮件；**两阶段**：先 `dryRun: true` 预览收件人/主题/正文（不入队），再去掉 dryRun 真正入发件箱 |
+
+- 工具以插件自有账户为作用域；宿主注入的 `connectionId` 只接受、不透传。
+- 凭据红线：参数与输出都不含密码/令牌；工具定义经断言校验不出现敏感词。
+- `mail_send` 不支持附件；发送经发件箱队列投递并保留撤销窗口。
+
+## 1.3 DBX 连接管理（connection-provider）
+
+在 **DBX 宿主连接管理器**里也能创建、测试、连接、断开邮件账户
+（`connection-provider` 贡献点，表单字段与插件内 `account/add` 参数对齐）：
+
+- **账户类型 `kind`**：`imap`（IMAP/SMTP 服务器，含 host/port/加密/用户名/密码）或
+  `graph`（Microsoft 365 / Outlook.com：邮箱 + Azure `clientId`，租户默认 `common`）。
+- **Graph 双模式**（`auth_mode`）：
+  - *浏览器授权*（默认）：`connection/connect` 只创建账户壳并提示授权；随后在插件
+    工作台对该账户点「重新授权」完成 Microsoft 登录，文件夹与邮件即开始同步。
+  - *纯后台（App-only）*：选 App-only 后追加 `clientSecret`（宿主密钥库托管）与
+    `userId`（目标邮箱的 Object ID / UPN，留空回退邮箱地址）两栏；`connection/test`
+    用 client_credentials 换一次应用令牌验证，`connection/connect` 成功后建
+    `oauth2_app` 账户并立即后台首拉，全程无浏览器交互。
+- **生命周期**：`connection/test` 校验（IMAP/SMTP 探测；Graph 浏览器态不做网络
+  探测、纯后台态换令牌验证）；`connection/connect` 以 `connection.id` 为 key
+  幂等建会话并复用既有同步引擎；`connection/disconnect` 停会话但保留本地缓存。
+- **凭据语义**：宿主连接的密码与 client secret 只出现在生命周期请求里，驻留
+  Sidecar **内存会话表**，绝不写入本地密钥库或 SQLite；`connection/disconnect`
+  随会话一起丢弃。
+- 与插件内向导并存：向导账户（含 Graph）继续可用；两种来源的账户以 `hostBound`
+  标记区分，`connection/disconnect` 只解绑不移除数据。
+
 ## 2. 架构
 
 ```
@@ -46,9 +119,13 @@
 └───────────────────────────────────────────────────────────────────────────────┼─────┘
                                                                                 │
 ┌──────────────────────── Sidecar：backend（Rust / tokio）──────────────────────▼─────┐
-│ main.rs     逐行读 JSON-RPC，握手 plugin/initialize，分发 30 余个方法               │
+│ main.rs     逐行读 JSON-RPC，握手 plugin/initialize，分发 40 余个方法               │
 │ accounts.rs 服务商预设、账户增删改查、连接测试、文件夹发现                          │
+│ hostconn.rs DBX 宿主连接生命周期：test/connect/disconnect、内存会话表、Graph 壳     │
+│ mcp.rs      MCP 工具面：mcp/tools 纯发现 + mcp/call（列表/阅读/旗标/移动/发送）     │
 │ imap.rs     async-imap + rustls（SSL/TLS 与 STARTTLS），UTF-7 文件夹名编解码         │
+│ oauth.rs    OAuth2 授权码 + PKCE、127.0.0.1 回环回调、token 刷新与轮换回存           │
+│ graph.rs    Microsoft Graph REST：folders/delta/$value/flags/move/MIME 发送          │
 │ smtp.rs     lettre（SSL/TLS / STARTTLS / 明文），mail-builder 组装 MIME             │
 │ mime.rs     mail-parser 解析、cid: 内联图转 data URL、附件与正文抽取、会话 key       │
 │ sync.rs     增量同步、旗标双向、按需取正文、移动/删除、SMTP 投递 + APPEND 已发送     │
@@ -84,14 +161,17 @@
 
 ## 4. 构建
 
-前置：Node 20+、Rust stable（Windows 用 **gnu** 工具链：`stable-x86_64-pc-windows-gnu`，
-MSVC 的 `link.exe` 常被 Git 的 `link` 抢占）、`cargo` 走镜像（`backend/.cargo/config.toml` 已配 rsproxy）。
+前置：Node 20+、Rust stable、`cargo` 走镜像（`backend/.cargo/config.toml` 已配 rsproxy）。
+Windows 本机若没有 MSVC Build Tools、或 MSVC 的 `link.exe` 被 Git 自带的 `link` 抢占，
+在该机器上执行 `rustup default stable-x86_64-pc-windows-gnu` 切 gnu 工具链（机器级设置，
+仓库不携带工具链文件——`rust-toolchain.toml` 对全平台生效，钉 windows-gnu 会让 macOS/Linux 上
+cwd 位于 `backend/` 的 cargo 直接报非法工具链）。
 
 ```bash
 npm install
 npm run build          # vite → ui/（单文件 bundle，不可拆包）
 npm run backend        # cargo build --release → backend/target/release/backend[.exe]
-npm run sidecar-check  # 15 项协议冒烟测试（握手 / 设置 / 目录 / 列表 / 错误码）
+npm run sidecar-check  # 42 项协议冒烟（握手 / 设置 / 目录 / 列表 / 错误码 / Graph 全链路，需 debug 构建）
 npm run pack           # scripts/package.mjs → release/<id>-<version>-<当前平台>.dbxp（本地只能打当前平台）
 ```
 
@@ -102,8 +182,7 @@ npm run pack           # scripts/package.mjs → release/<id>-<version>-<当前�
 等 5 个 job 绿 → 下载 `release-candidates.json` 生成商店候选。
 带原生 Sidecar 的插件无法产出 universal 包，官方 CLI 会直接拒绝跨平台打包。
 
-- `backend/rust-toolchain.toml` 固定 `stable-x86_64-pc-windows-gnu`：本机没有 MSVC Build Tools，
-  默认 MSVC 工具链的 `link.exe` 又常被 Git 自带的 `link` 抢占。
+- 多平台包由 CI 按 runner 原生 stable 工具链构建（Windows 为 MSVC），仓库不固定工具链。
 - `npm run pack` 用本地打包器复刻官方 CLI 的产物格式（同样的目录布局、`checksums.json`、
   `artifact.json` 与改写后的 `manifest.json`）。之所以不用 `npm run pack:cli`：官方 CLI 以 `\\?\`
   前缀路径调用 cargo，MinGW 的 ld 无法处理，且没有跳过编译的开关。
@@ -131,7 +210,7 @@ dbx-mail/
 
 ## 6. 已知限制
 
-- 只支持 IMAP/SMTP（不含 POP3、JMAP、Exchange 直连）。
+- IMAP 账户只支持 IMAP/SMTP（不含 POP3、JMAP）；Microsoft 365 / Outlook.com 走 Graph API（见 §1.1）。Graph 账户的「已回复」标记为近似值（Graph 列表不提供 answered 旗标）。
 - 富文本编辑器使用 `document.execCommand`，是本机 Chromium 的行为，功能足够但已废弃；后续可换可编辑层。
 - 会话聚合依赖邮件头的 `References` / `In-Reply-To`，主题相同但无引用头的邮件不会合并。
 - 搜索为 SQLite `LIKE`（不是 FTS5）：几千封邮件的本地缓存下足够快，超过十万封需要换 FTS。

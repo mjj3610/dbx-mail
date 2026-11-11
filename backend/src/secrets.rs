@@ -28,6 +28,15 @@ pub struct SecretStore {
 impl SecretStore {
     /// 在插件数据目录下初始化
     pub fn new(dir: &Path) -> Self {
+        // debug/测试可强制本地加密文件通道：无人值守跑真实验收时，
+        // 新二进制首次读取钥匙串会触发 macOS 授权弹窗并挂起
+        #[cfg(debug_assertions)]
+        if std::env::var("DBX_MAIL_SECRET_FILE").ok().as_deref() == Some("1") {
+            return Self {
+                dir: dir.to_path_buf(),
+                keyring_ok: false,
+            };
+        }
         // 先用一次写入探测凭据库是否可用（Windows 上服务不可用会直接报错）
         let keyring_ok = match keyring::Entry::new(SERVICE, "__probe__") {
             Ok(entry) => {
